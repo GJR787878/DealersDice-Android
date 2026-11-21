@@ -817,6 +817,28 @@ index 2f2848c..6cb9d76 100644
          try {
              SteamService.fetchFileWithFallback(
                  fileName = "container_files/${component.name}",
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index 0099a10..d8afbf7 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -1,5 +1,5 @@
+ ﻿<resources>
+-    <string name="app_name">GameNative</string>
++    <string name="app_name">荷官骰子</string>
+     <string name="login_user">登录</string>
+     <string name="login_2fa">双重验证</string>
+     <string name="home">主页</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index 6cda123..3d51d33 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -1,5 +1,5 @@
+ ﻿<resources>
+-    <string name="app_name">GameNative</string>
++    <string name="app_name">荷官骰子</string>
+     <string name="login_user">登入</string>
+     <string name="login_2fa">雙重驗證</string>
+     <string name="home">主頁</string>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
 index f75aaac..0f97937 100644
 --- a/app/src/main/res/values/strings.xml
