@@ -575,7 +575,7 @@ index 0000000..b818bd7
 +}
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerDiag.kt b/app/src/main/java/app/gamenative/dealers/DealerDiag.kt
 new file mode 100644
-index 0000000..e71d414
+index 0000000..7bd7481
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerDiag.kt
 @@ -0,0 +1,404 @@
@@ -729,7 +729,7 @@ index 0000000..e71d414
 +        }.onFailure { warn("containerReport failed", it) }
 +    }
 +
-+    fun componentsReport(context: Context) {
++    suspend fun componentsReport(context: Context) {
 +        runCatching {
 +            val lists = ManifestComponentHelper.loadInstalledContentLists(context)
 +            block(
