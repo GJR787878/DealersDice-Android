@@ -81,10 +81,10 @@ index 4926d11..8486234 100644
      // hardware. The settings switch requests the Bluetooth permissions before it can be turned on.
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerBoot.kt b/app/src/main/java/app/gamenative/dealers/DealerBoot.kt
 new file mode 100644
-index 0000000..7c0f53f
+index 0000000..13e98b4
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerBoot.kt
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,296 @@
 +package app.gamenative.dealers
 +
 +import android.content.Context
@@ -190,14 +190,19 @@ index 0000000..7c0f53f
 +     */
 +    suspend fun ensureReady(context: Context, onProgress: (Float, String) -> Unit): String {
 +        onProgress(0f, "准备中")
++        DealerDiag.stage("ensureReady.start", "ready=${isReady(context)}")
++        val totalAt = System.currentTimeMillis()
 +
 +        val dir = gameDir(context)
 +        if (!isReady(context) || !dir.isDirectory) {
 +            dir.mkdirs()
 +            onProgress(0.02f, "解压游戏")
++            val extractAt = System.currentTimeMillis()
 +            extractGame(context, dir) { p ->
 +                onProgress(p * PROGRESS_EXTRACT, "解压游戏 ${(p * 100).toInt()}%")
 +            }
++            DealerDiag.stage("extract.done", "ms=${System.currentTimeMillis() - extractAt}")
++            DealerDiag.gameDirReport(context)
 +        }
 +
 +        onProgress(0.6f, "注册游戏")
@@ -213,9 +218,14 @@ index 0000000..7c0f53f
 +                "CUSTOM_GAME_1"
 +            }
 +        Timber.i("DealerBoot: appId=$appId dir=${dir.absolutePath}")
++        DealerDiag.kv("boot.appId", appId)
 +
 +        onProgress(0.65f, "安装兼容层")
-+        installComponents(context) { p -> onProgress(0.65f + p * 0.3f, "安装兼容层 ${(p * 100).toInt()}%") }
++        val compAt = System.currentTimeMillis()
++        runCatching { installComponents(context) { p -> onProgress(0.65f + p * 0.3f, "安装兼容层 ${(p * 100).toInt()}%") } }
++            .onFailure { DealerDiag.error("installComponents failed", it); throw it }
++        DealerDiag.stage("components.done", "ms=${System.currentTimeMillis() - compAt}")
++        DealerDiag.componentsReport(context)
 +
 +        onProgress(0.97f, "配置容器")
 +        // 安装后按实际落盘的版本标识回填，避免写死字符串与镜像不一致
@@ -231,9 +241,11 @@ index 0000000..7c0f53f
 +
 +        val container = ContainerUtils.getOrCreateContainer(context, appId)
 +        applyContainerConfig(context, container, wineVersion, fexVersion)
++        DealerDiag.containerReport(context, appId)
 +
 +        markerFile(context).parentFile?.mkdirs()
 +        markerFile(context).writeText(appId)
++        DealerDiag.stage("ensureReady.done", "ms=${System.currentTimeMillis() - totalAt}")
 +        onProgress(1f, "完成")
 +        return appId
 +    }
@@ -371,10 +383,10 @@ index 0000000..7c0f53f
 +}
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt b/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt
 new file mode 100644
-index 0000000..1fce3b7
+index 0000000..b818bd7
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,186 @@
 +package app.gamenative.dealers
 +
 +import android.os.Bundle
@@ -419,6 +431,10 @@ index 0000000..1fce3b7
 +
 +    override fun onCreate(savedInstanceState: Bundle?) {
 +        super.onCreate(savedInstanceState)
++        DealerDiag.start(this)
++        DealerDiag.stage("activity.onCreate", "intent=${intent?.action}")
++        DealerDiag.payloadReport(this)
++        DealerDiag.gameDirReport(this)
 +        DealerBoot.applyHudPrefs()
 +        setContent { DealerRoot() }
 +        // 覆盖层要压在 Compose 内容之上，等 decor 有子 View 后再挂
@@ -441,8 +457,10 @@ index 0000000..1fce3b7
 +        val picked = screen
 +        if (picked == null) {
 +            val options = remember { DealerBoot.resolutionOptions(this@DealerBootActivity) }
++            DealerDiag.kv("resolution.options", options.joinToString(","))
 +            ResolutionPicker(options) { v ->
 +                DealerBoot.saveResolution(this@DealerBootActivity, v)
++                DealerDiag.kv("resolution.picked", v)
 +                screen = v
 +            }
 +            return
@@ -456,7 +474,14 @@ index 0000000..1fce3b7
 +                        label = text
 +                    }
 +                }
-+            }.onFailure { Timber.e(it, "DealerBoot.ensureReady failed") }.getOrNull()
++            }.onFailure {
++                Timber.e(it, "DealerBoot.ensureReady failed")
++                DealerDiag.error("ensureReady failed", it)
++            }.getOrNull()
++            DealerDiag.containerReport(this@DealerBootActivity, id ?: "CUSTOM_GAME_1")
++            DealerDiag.componentsReport(this@DealerBootActivity)
++            DealerDiag.gameDirReport(this@DealerBootActivity)
++            DealerDiag.stage("game.start", "appId=$id")
 +            appId = id
 +        }
 +
@@ -548,12 +573,422 @@ index 0000000..1fce3b7
 +        }
 +    }
 +}
+diff --git a/app/src/main/java/app/gamenative/dealers/DealerDiag.kt b/app/src/main/java/app/gamenative/dealers/DealerDiag.kt
+new file mode 100644
+index 0000000..e71d414
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/DealerDiag.kt
+@@ -0,0 +1,404 @@
++package app.gamenative.dealers
++
++import android.app.ActivityManager
++import android.content.Context
++import android.content.pm.PackageManager
++import android.os.Build
++import android.os.Debug
++import android.os.Process
++import android.os.StatFs
++import android.system.Os
++import android.system.OsConstants
++import android.util.Log
++import app.gamenative.PrefManager
++import app.gamenative.utils.ContainerUtils
++import app.gamenative.utils.ManifestComponentHelper
++import com.winlator.container.Container
++import java.io.File
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * 荷官骰子 —— 诊断日志。
++ *
++ * 目的：装机后出现黑屏 / 闪退 / 卡顿 / 分辨率不对时，能直接从 LogFox 里把这台机器的真实情况读出来，
++ * 不用让用户来回猜。所有行都打在 logcat 的 tag [TAG] 下，LogFox 过滤 `DealerDiag` 即可看到；
++ * 同时落一份到 `Android/data/app.gamenative/files/dealer_diag.log`，重装前也能取。
++ *
++ * 记录内容分三层：
++ * 1) 环境基线（机型 / SoC / 系统 / 页面大小 / 内存 / 存储 / 屏幕与刷新率 / Vulkan 能力 / 驱动）；
++ * 2) 首启链路（解压耗时、字节数、兼容层安装、容器最终配置、appId）；
++ * 3) 运行期采样（帧率、PSS、Java 堆、线程数、进程 CPU、Surface 尺寸、HUD 位置）。
++ */
++object DealerDiag {
++
++    const val TAG = "DealerDiag"
++
++    private const val FILE_NAME = "dealer_diag.log"
++    private const val MAX_FILE_BYTES = 4L * 1024 * 1024
++
++    private val fmt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
++    private val bootAt = System.currentTimeMillis()
++
++    @Volatile
++    private var started = false
++
++    @Volatile
++    private var appContext: Context? = null
++
++    /** 单次启动的标记，便于在 logcat 里区分多次启动 */
++    @Volatile
++    private var sessionTag: String = "boot"
++
++    fun start(context: Context, session: String = "boot") {
++        appContext = context.applicationContext
++        sessionTag = session
++        if (started) return
++        started = true
++
++        write("========== DealerDiag start ==========")
++        write("session=$session pkg=${context.packageName} pid=${Process.myPid()} uptimeMs=${System.currentTimeMillis()}")
++        installCrashHandler()
++        deviceReport(context)
++        prefsReport()
++    }
++
++    fun file(context: Context): File =
++        File(context.getExternalFilesDir(null), FILE_NAME)
++
++    fun pathOf(context: Context): String = file(context).absolutePath
++
++    fun stage(name: String, detail: String = "") {
++        write("STAGE $name ${detail}".trim())
++    }
++
++    fun kv(key: String, value: Any?) {
++        write("KV $key=${value ?: "-"}")
++    }
++
++    fun block(section: String, values: Map<String, Any?>) {
++        write("----- $section -----")
++        values.forEach { (k, v) -> write("  $k = ${v ?: "-"}") }
++    }
++
++    fun warn(message: String, t: Throwable? = null) {
++        write("WARN $message${t?.let { " | ${it.javaClass.simpleName}: ${it.message}" } ?: ""}")
++        if (t != null) write("STACK ${Log.getStackTraceString(t)}")
++    }
++
++    fun error(message: String, t: Throwable? = null) {
++        write("ERROR $message${t?.let { " | ${it.javaClass.simpleName}: ${it.message}" } ?: ""}")
++        if (t != null) write("STACK ${Log.getStackTraceString(t)}")
++    }
++
++    /** 运行期采样：一行一条，便于 LogFox 里纵向对比 */
++    fun sample(
++        fps: Float? = null,
++        surfaceW: Int? = null,
++        surfaceH: Int? = null,
++        extra: String = "",
++    ) {
++        val ctx = appContext ?: return
++        val heapUsedMb = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024)
++        val heapMaxMb = Runtime.getRuntime().maxMemory() / (1024 * 1024)
++        val pssMb = runCatching {
++            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
++            am.getProcessMemoryInfo(intArrayOf(Process.myPid()))[0].totalPss / 1024
++        }.getOrNull()
++        val cpuPct = runCatching { processCpuPct() }.getOrNull()
++        val sb = StringBuilder("SAMPLE")
++        sb.append(" fps=").append(fps?.let { String.format(Locale.US, "%.1f", it) } ?: "-")
++        sb.append(" surface=").append(surfaceW ?: -1).append("x").append(surfaceH ?: -1)
++        sb.append(" pssMb=").append(pssMb ?: -1)
++        sb.append(" heap=").append(heapUsedMb).append("/").append(heapMaxMb).append("Mb")
++        sb.append(" threads=").append(Thread.activeCount())
++        sb.append(" cpu=").append(
++            cpuPct?.takeIf { it >= 0.0 }?.let { String.format(Locale.US, "%.0f%%", it) } ?: "-",
++        )
++        sb.append(" activity=").append(currentActivityName())
++        if (extra.isNotEmpty()) sb.append(" ").append(extra)
++        write(sb.toString())
++    }
++
++    /** 容器实际生效的配置：出问题时先看这一段，能立刻分辨是配置没写进去还是驱动不给力 */
++    fun containerReport(context: Context, appId: String) {
++        runCatching {
++            val container = ContainerUtils.getContainer(context, appId)
++            val data = ContainerUtils.toContainerData(container)
++            block(
++                "container[$appId]",
++                mapOf(
++                    "name" to data.name,
++                    "screenSize" to data.screenSize,
++                    "wineVersion" to data.wineVersion,
++                    "fexcoreVersion" to data.fexcoreVersion,
++                    "box64Version" to data.box64Version,
++                    "graphicsDriver" to data.graphicsDriver,
++                    "dxwrapper" to data.dxwrapper,
++                    "dxwrapperConfig" to data.dxwrapperConfig,
++                    "executablePath" to data.executablePath,
++                    "execArgs" to data.execArgs,
++                    "envVars" to data.envVars,
++                    "showFPS" to data.showFPS,
++                    "cpuList" to data.cpuList,
++                    "fpsLimiter" to "${PrefManager.dealerFpsCap}",
++                ),
++            )
++        }.onFailure { warn("containerReport failed", it) }
++    }
++
++    fun componentsReport(context: Context) {
++        runCatching {
++            val lists = ManifestComponentHelper.loadInstalledContentLists(context)
++            block(
++                "components",
++                mapOf(
++                    "proton" to lists.installed.proton.joinToString(","),
++                    "fexcore" to lists.installed.fexcore.joinToString(","),
++                    "box64" to lists.installed.box64.joinToString(","),
++                    "wowbox64" to lists.installed.wowBox64.joinToString(","),
++                    "wine" to lists.installed.wine.joinToString(","),
++                    "dxvk" to lists.installed.dxvk.joinToString(","),
++                    "vkd3d" to lists.installed.vkd3d.joinToString(","),
++                ),
++            )
++        }.onFailure { warn("componentsReport failed", it) }
++    }
++
++    fun prefsReport() {
++        runCatching {
++            block(
++                "prefs",
++                mapOf(
++                    "dealerScreenSize" to PrefManager.dealerScreenSize,
++                    "dealerFpsCap" to PrefManager.dealerFpsCap,
++                    "showFps" to PrefManager.showFps,
++                    "hudFrameRate" to PrefManager.performanceHudShowFrameRate,
++                    "hudCpu" to PrefManager.performanceHudShowCpuUsage,
++                    "hudGpu" to PrefManager.performanceHudShowGpuUsage,
++                    "hudCompact" to PrefManager.performanceHudCompactMode,
++                    "hudXFraction" to PrefManager.performanceHudXFraction,
++                    "hudYFraction" to PrefManager.performanceHudYFraction,
++                ),
++            )
++        }.onFailure { warn("prefsReport failed", it) }
++    }
++
++    /** 环境基线：这一台机器到底长什么样 */
++    fun deviceReport(context: Context) {
++        runCatching {
++            val dm = context.resources.displayMetrics
++            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
++            val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
++
++            val features = runCatching {
++                context.packageManager.systemAvailableFeatures
++                    .mapNotNull { it.name }
++                    .filter { it.startsWith("android.hardware.vulkan") }
++                    .joinToString(",")
++            }.getOrDefault("-")
++
++            val modes = runCatching {
++                val d = primaryDisplay(context)
++                d?.supportedModes?.joinToString(",") { "${it.physicalWidth}x${it.physicalHeight}@${it.refreshRate}" } ?: "-"
++            }.getOrDefault("-")
++
++            block(
++                "device",
++                mapOf(
++                    "brand" to Build.BRAND,
++                    "manufacturer" to Build.MANUFACTURER,
++                    "model" to Build.MODEL,
++                    "device" to Build.DEVICE,
++                    "product" to Build.PRODUCT,
++                    "hardware" to Build.HARDWARE,
++                    "board" to Build.BOARD,
++                    "socManufacturer" to (if (Build.VERSION.SDK_INT >= 31) Build.SOC_MANUFACTURER else "-"),
++                    "socModel" to (if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else "-"),
++                    "androidRelease" to Build.VERSION.RELEASE,
++                    "sdkInt" to Build.VERSION.SDK_INT,
++                    "securityPatch" to (if (Build.VERSION.SDK_INT >= 23) Build.VERSION.SECURITY_PATCH else "-"),
++                    "fingerprint" to Build.FINGERPRINT,
++                    "abis" to Build.SUPPORTED_ABIS.joinToString(","),
++                    "is64bit" to Process.is64Bit(),
++                    "cpuAbi" to Build.CPU_ABI,
++                    "cpuCores" to Runtime.getRuntime().availableProcessors(),
++                    "cpuMaxFreqs" to cpuMaxFreqs(),
++                    "pageSizeBytes" to pageSize(),
++                    "kernelRelease" to System.getProperty("os.version"),
++                    "ramTotalMb" to mi.totalMem / (1024 * 1024),
++                    "ramAvailMb" to mi.availMem / (1024 * 1024),
++                    "ramLowMemory" to mi.lowMemory,
++                    "heapMaxMb" to Runtime.getRuntime().maxMemory() / (1024 * 1024),
++                    "storageInternal" to storage(context.filesDir),
++                    "storageExternal" to storage(context.getExternalFilesDir(null)),
++                    "screenPx" to "${dm.widthPixels}x${dm.heightPixels}",
++                    "densityDpi" to dm.densityDpi,
++                    "density" to dm.density,
++                    "refreshRate" to runCatching { primaryDisplay(context)?.refreshRate }.getOrNull(),
++                    "supportedModes" to modes,
++                    "vulkanFeatures" to features,
++                    "gpu" to gpuIdentity(),
++                    "eglDriver" to systemProp("ro.hardware.egl"),
++                    "vulkanDriver" to systemProp("ro.hardware.vulkan"),
++                    "socPlatform" to systemProp("ro.board.platform"),
++                    "vulkan1_1" to runCatching { context.packageManager.hasSystemFeature("android.hardware.vulkan.version", 0x400001) }.getOrDefault(false),
++                    "vulkan1_3" to runCatching { context.packageManager.hasSystemFeature("android.hardware.vulkan.version", 0x400003) }.getOrDefault(false),
++                    "vulkanLevel3" to runCatching { context.packageManager.hasSystemFeature("android.hardware.vulkan.level", 3) }.getOrDefault(false),
++                    "vulkanCompute" to runCatching { context.packageManager.hasSystemFeature("android.hardware.vulkan.compute") }.getOrDefault(false),
++                ),
++            )
++            kv("diagFile", pathOf(context))
++        }.onFailure { warn("deviceReport failed", it) }
++    }
++
++    /** 内置资源清单：确认包内文件是不是齐、大小对不对 */
++    fun payloadReport(context: Context) {
++        runCatching {
++            var count = 0
++            var bytes = 0L
++            val parts = mutableListOf<String>()
++            context.assets.list("dealer/payload")?.sorted()?.forEach { name ->
++                val size = runCatching { context.assets.open("dealer/payload/$name").available().toLong() }.getOrDefault(-1)
++                parts += "$name=$size"
++                count++
++                if (size > 0) bytes += size
++            }
++            val gameZip = runCatching { context.assets.open("dealer/game.zip").available().toLong() }.getOrDefault(-1)
++            block(
++                "payload",
++                mapOf(
++                    "payloadFiles" to count,
++                    "payloadBytes" to bytes,
++                    "gameZipBytes" to gameZip,
++                    "list" to parts.joinToString(" | "),
++                ),
++            )
++        }.onFailure { warn("payloadReport failed", it) }
++    }
++
++    fun gameDirReport(context: Context) {
++        runCatching {
++            val dir = DealerBoot.gameDir(context)
++            val marker = DealerBoot.isReady(context)
++            val exe = File(dir, DealerBoot.EXE_NAME)
++            block(
++                "gameDir",
++                mapOf(
++                    "path" to dir.absolutePath,
++                    "readyMarker" to marker,
++                    "exists" to dir.isDirectory,
++                    "fileCount" to (dir.listFiles()?.size ?: 0),
++                    "totalBytes" to (dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }),
++                    "exeExists" to exe.isFile(),
++                    "exeBytes" to if (exe.isFile()) exe.length() else -1,
++                ),
++            )
++        }.onFailure { warn("gameDirReport failed", it) }
++    }
++
++    fun hudReport(x: Float, y: Float, hostW: Int, hostH: Int, hudW: Int, hudH: Int) {
++        kv("hud.position", "x=$x y=$y host=${hostW}x${hostH} hud=${hudW}x${hudH}")
++    }
++
++    fun elapsedMs(): Long = System.currentTimeMillis() - bootAt
++
++    // ---------------------------------------------------------------- internals
++
++    private fun installCrashHandler() {
++        val previous = Thread.getDefaultUncaughtExceptionHandler()
++        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
++            runCatching {
++                error("FATAL on thread=${thread.name}", throwable)
++                sample(extra = "fatal")
++            }
++            previous?.uncaughtException(thread, throwable)
++        }
++    }
++
++    @Synchronized
++    private fun write(line: String) {
++        val stamped = "${fmt.format(Date())} [$sessionTag] $line"
++        runCatching { Log.i(TAG, stamped) }
++        val ctx = appContext ?: return
++        runCatching {
++            val f = file(ctx)
++            if (f.exists() && f.length() > MAX_FILE_BYTES) {
++                f.writeText("========== rotated ${fmt.format(Date())} ==========\n")
++            }
++            f.parentFile?.mkdirs()
++            f.appendText(stamped + "\n")
++        }
++    }
++
++    private fun storage(dir: File?): String {
++        val target = dir ?: return "-"
++        return runCatching {
++            val sf = StatFs(target.absolutePath)
++            val totalGb = sf.totalBytes / (1024.0 * 1024.0 * 1024.0)
++            val freeGb = sf.availableBytes / (1024.0 * 1024.0 * 1024.0)
++            String.format(Locale.US, "%.1fGb free/%.1fGb total", freeGb, totalGb)
++        }.getOrDefault("-")
++    }
++
++    private fun primaryDisplay(context: Context): android.view.Display? = runCatching {
++        val dm = context.getSystemService(android.hardware.display.DisplayManager::class.java)
++        dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
++    }.getOrNull()
++
++    private fun pageSize(): Long = runCatching { Os.sysconf(OsConstants._SC_PAGESIZE) }.getOrDefault(-1)
++
++    private fun cpuMaxFreqs(): String = runCatching {
++        val out = StringBuilder()
++        for (i in 0 until Runtime.getRuntime().availableProcessors()) {
++            val f = File("/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_max_freq")
++            val khz = runCatching { f.readText().trim().toLong() }.getOrDefault(-1)
++            if (khz > 0) {
++                if (out.isNotEmpty()) out.append(",")
++                out.append(khz / 1000)
++            }
++        }
++        out.toString()
++    }.getOrDefault("-")
++
++    private fun gpuIdentity(): String {
++        val kgsl = runCatching { File("/sys/class/kgsl/kgsl-3d0/gpu_model").takeIf { it.exists() }?.readText()?.trim() }.getOrNull()
++        return kgsl ?: systemProp("ro.gfx.driver.0")
++    }
++
++    private fun systemProp(key: String): String = runCatching {
++        val cls = Class.forName("android.os.SystemProperties")
++        val get = cls.getMethod("get", String::class.java)
++        (get.invoke(null, key) as? String)?.takeIf { it.isNotEmpty() } ?: "-"
++    }.getOrDefault("-")
++
++    private var lastProcJiffies = -1L
++    private var lastSysJiffies = -1L
++    private var lastCpuAt = 0L
++
++    /** 相邻两次采样的 CPU 占比（进程侧增量 / 系统侧增量 × 核数），比读累计值有意义 */
++    private fun processCpuPct(): Double {
++        val stat = File("/proc/self/stat").readText()
++        val fields = stat.substringAfterLast(')').trim().split(" ")
++        val proc = fields[11].toLong() + fields[12].toLong()
++        val sys = File("/proc/stat").readText().lineSequence().first { it.startsWith("cpu ") }
++            .trim().split(Regex("\\s+")).drop(1).sumOf { it.toLongOrNull() ?: 0L }
++
++        val prevProc = lastProcJiffies
++        val prevSys = lastSysJiffies
++        lastProcJiffies = proc
++        lastSysJiffies = sys
++        if (prevProc < 0 || prevSys < 0 || sys <= prevSys) return -1.0
++        lastCpuAt = System.currentTimeMillis()
++        return ((proc - prevProc).toDouble() / (sys - prevSys).toDouble()) * 100.0
++    }
++
++    private fun currentActivityName(): String = runCatching {
++        val ctx = appContext ?: return "-"
++        val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
++        am.appTasks.joinToString(",") { task ->
++            (task.taskInfo?.topActivity?.className ?: "-").substringAfterLast('.')
++        }
++        }.getOrDefault("-")
++}
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt b/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt
 new file mode 100644
-index 0000000..2e33f30
+index 0000000..52c0cf9
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,130 @@
 +package app.gamenative.dealers
 +
 +import android.content.Context
@@ -609,6 +1044,7 @@ index 0000000..2e33f30
 +        }
 +        host.addView(this, lp)
 +        bringToFront()
++        DealerDiag.kv("overlay.attached", "host=${host.width}x${host.height}")
 +    }
 +
 +    private fun sendEscape() {
@@ -618,7 +1054,11 @@ index 0000000..2e33f30
 +        val xServer = PluviaApp.xEnvironment
 +            ?.getComponent(XServerComponent::class.java)
 +            ?.xServer
-+            ?: return
++        if (xServer == null) {
++            DealerDiag.warn("overlay.esc 无 XServer，注入跳过")
++            return
++        }
++        DealerDiag.kv("overlay.esc", "inject")
 +        runCatching {
 +            xServer.injectKeyPress(XKeycode.KEY_ESC)
 +            postDelayed({ runCatching { xServer.injectKeyRelease(XKeycode.KEY_ESC) } }, 80)
@@ -632,6 +1072,8 @@ index 0000000..2e33f30
 +        PrefManager.dealerFpsCap = next
 +        PluviaApp.xServerView?.setFrameRateLimit(next)
 +        refreshFpsLabel()
++        DealerDiag.kv("overlay.fpsCap", next)
++        DealerDiag.sample(extra = "fpsCap=$next")
 +    }
 +
 +    private fun refreshFpsLabel() {
@@ -745,10 +1187,42 @@ index 0000000..272a596
 +    }
 +}
 diff --git a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
-index 9328d7c..7d5b8c5 100644
+index 9328d7c..d649168 100644
 --- a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
 +++ b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
-@@ -944,8 +944,9 @@ fun XServerScreen(
+@@ -94,6 +94,7 @@ import androidx.lifecycle.LifecycleOwner
+ import androidx.lifecycle.compose.LocalLifecycleOwner
+ import app.gamenative.PluviaApp
+ import app.gamenative.PrefManager
++import app.gamenative.dealers.DealerDiag
+ import app.gamenative.display.GamescopeInputSink
+ import app.gamenative.display.GamescopePayload
+ import app.gamenative.SteamBootstrap
+@@ -768,6 +769,23 @@ fun XServerScreen(
+         }
+     }
+ 
++    // 荷官骰子诊断：会话期内周期性把帧率、显存无关的进程指标、Surface 尺寸打进 LogFox 可读的日志
++    LaunchedEffect(Unit) {
++        DealerDiag.stage("xserver.session.start", "appId=$appId screenSize=${container.screenSize}")
++        while (true) {
++            delay(10_000)
++            runCatching {
++                val v = ui.xServerView as? View
++                DealerDiag.sample(
++                    fps = fpsProvider(),
++                    surfaceW = v?.width,
++                    surfaceH = v?.height,
++                    extra = "display=$isX11Display fpsTarget=${PrefManager.dealerFpsCap}",
++                )
++            }
++        }
++    }
++
+     fun applyPerformanceHudConfig(config: PerformanceHudConfig) {
+         ui.performanceHudConfig = config
+         persistPerformanceHudConfig(config)
+@@ -944,11 +962,13 @@ fun XServerScreen(
          val savedX = PrefManager.performanceHudXFraction
          val savedY = PrefManager.performanceHudYFraction
  
@@ -760,6 +1234,10 @@ index 9328d7c..7d5b8c5 100644
  
          PrefManager.performanceHudXFraction = if (maxX > 0f) hud.x / maxX else 0f
          PrefManager.performanceHudYFraction = if (maxY > 0f) hud.y / maxY else 0f
++        DealerDiag.hudReport(hud.x, hud.y, host.width, host.height, hud.width, hud.height)
+     }
+ 
+     fun movePerformanceHud(rawX: Float, rawY: Float, save: Boolean) {
 diff --git a/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt b/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
 index d71e12b..8a7cee1 100644
 --- a/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
