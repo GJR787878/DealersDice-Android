@@ -985,15 +985,17 @@ index 0000000..7bd7481
 +}
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt b/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt
 new file mode 100644
-index 0000000..52c0cf9
+index 0000000..c71b6af
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,141 @@
 +package app.gamenative.dealers
 +
 +import android.content.Context
 +import android.graphics.Color
++import android.graphics.Typeface
 +import android.graphics.drawable.GradientDrawable
++import android.view.MotionEvent
 +import android.os.SystemClock
 +import android.util.TypedValue
 +import android.view.Gravity
@@ -1014,8 +1016,8 @@ index 0000000..52c0cf9
 + */
 +class DealerOverlayView(context: Context) : LinearLayout(context) {
 +
-+    private val menuButton: TextView = capsule(context, "菜单")
-+    private val fpsButton: TextView = capsule(context, "帧率")
++    private val menuButton: TextView = plaqueButton(context, "菜单")
++    private val fpsButton: TextView = plaqueButton(context, "帧率")
 +    private var lastPress = 0L
 +
 +    init {
@@ -1091,22 +1093,31 @@ index 0000000..52c0cf9
 +            TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), context.resources.displayMetrics,
 +        ).toInt()
 +
-+        fun capsule(context: Context, label: String): TextView = TextView(context).apply {
++        /** 牌匾底图（内置透明 PNG）上的按钮：黑体字、米白匾面，按下时压暗 */
++        fun plaqueButton(context: Context, label: String): TextView = TextView(context).apply {
 +            text = label
-+            setTextColor(Color.WHITE)
-+            textSize = 13f
++            setTextColor(0xFF15130F.toInt())
++            textSize = 15f
 +            gravity = Gravity.CENTER
-+            val padH = dp(context, 14)
-+            val padV = dp(context, 6)
++            typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
++            letterSpacing = 0.08f
++            val padH = dp(context, 26)
++            val padV = dp(context, 9)
 +            setPadding(padH, padV, padH, padV)
-+            background = GradientDrawable().apply {
++            background = PlaqueDrawable.load(context) ?: GradientDrawable().apply {
 +                cornerRadius = dp(context, 22).toFloat()
-+                setColor(0xCC1C1C1E.toInt())
-+                setStroke(dp(context, 1), 0x66FFFFFF)
++                setColor(0xF2EDEBE3.toInt())
++                setStroke(dp(context, 2), 0xFF15130F.toInt())
 +            }
 +            isClickable = true
 +            isFocusable = true
-+            alpha = 0.92f
++            setOnTouchListener { v, e ->
++                when (e.actionMasked) {
++                    MotionEvent.ACTION_DOWN -> v.alpha = 0.72f
++                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.alpha = 1f
++                }
++                false
++            }
 +        }
 +    }
 +}
@@ -1118,6 +1129,247 @@ index 0000000..52c0cf9
 +    val overlay = DealerOverlayView(activity)
 +    overlay.tag = "dealer_overlay"
 +    overlay.attachTo(decor)
++}
+diff --git a/app/src/main/java/app/gamenative/dealers/DealerTouch.kt b/app/src/main/java/app/gamenative/dealers/DealerTouch.kt
+new file mode 100644
+index 0000000..0699d3c
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/DealerTouch.kt
+@@ -0,0 +1,211 @@
++package app.gamenative.dealers
++
++import android.view.MotionEvent
++import android.view.View
++import com.winlator.xserver.Pointer
++import com.winlator.xserver.XServer
++import kotlin.math.hypot
++import kotlin.math.roundToInt
++
++/**
++ * 荷官骰子专用触摸 → 鼠标翻译。
++ *
++ * 语义（按需求逐条对齐）：
++ *  - 轻点：在手指落点直接左键按下 → 抬起，等于一次左键单击，坐标就是手指所在位置；
++ *  - 长按（按住不动超过 420ms）：抬起左键 → 按下右键，直到松手，等于一次右键；
++ *  - 按住拖动（按住并移动超过容差）：保持左键按下并跟随手指移动，等于"按住左键拖动"；
++ *  - 双指捏合/张开：转成滚轮。两指分开 = 滚轮向上（放大），两指收拢 = 滚轮向下（缩小），
++ *    每滑过固定的物理距离发一格，避免缩放过快或过慢；
++ *  - 长按与拖动靠"是否超过容差"严格互斥，不会互相触发。
++ *
++ * 所有坐标按 XServer 的实际屏幕尺寸换算，触到哪就是哪，不等比拉伸也不会偏。
++ */
++object DealerTouch {
++
++    private const val MODE_IDLE = 0
++    private const val MODE_LEFT = 1
++    private const val MODE_DRAG = 2
++    private const val MODE_RIGHT = 3
++    private const val MODE_PINCH = 4
++
++    /** 一格滚轮对应的双指间距变化（dp） */
++    private const val PINCH_STEP_DP = 16f
++
++    private var mode = MODE_IDLE
++    private var downX = 0f
++    private var downY = 0f
++    private var moved = false
++    private var longPressRunnable: Runnable? = null
++    private var pinchPrevDist = 0f
++    private var pinchAccum = 0f
++    private var pinchWheelSteps = 0
++
++    private fun slopPx(view: View): Float =
++        DealerUi.TAP_SLOP_DP * view.resources.displayMetrics.density
++
++    private fun stepPx(view: View): Float =
++        PINCH_STEP_DP * view.resources.displayMetrics.density
++
++    /**
++     * 屏幕坐标换算：用 rawX/rawY（屏幕绝对坐标）减去 XServer 视图在屏幕上的左上角，
++     * 这样无论视图在容器里被留边还是居中，落点都对得上手指实际触到的像素。
++     */
++    private fun toScreen(event: MotionEvent, view: View, xServer: XServer): Pair<Int, Int> {
++        val loc = IntArray(2)
++        view.getLocationOnScreen(loc)
++        val vw = view.width.coerceAtLeast(1)
++        val vh = view.height.coerceAtLeast(1)
++        val sw = xServer.screenInfo.width.coerceAtLeast(1)
++        val sh = xServer.screenInfo.height.coerceAtLeast(1)
++        val localX = event.rawX - loc[0]
++        val localY = event.rawY - loc[1]
++        val x = (localX / vw * sw).roundToInt().coerceIn(0, sw - 1)
++        val y = (localY / vh * sh).roundToInt().coerceIn(0, sh - 1)
++        return x to y
++    }
++
++    private fun twoFingerDistance(event: MotionEvent): Float {
++        val dx = event.getX(1) - event.getX(0)
++        val dy = event.getY(1) - event.getY(0)
++        return hypot(dx, dy)
++    }
++
++    private fun wheel(xServer: XServer, up: Boolean) {
++        val button = if (up) Pointer.Button.BUTTON_SCROLL_UP else Pointer.Button.BUTTON_SCROLL_DOWN
++        runCatching {
++            xServer.injectPointerButtonPress(button)
++            xServer.injectPointerButtonRelease(button)
++        }.onFailure { DealerDiag.warn("wheel inject failed", it) }
++    }
++
++    private fun releaseAll(xServer: XServer) {
++        runCatching {
++            if (mode == MODE_LEFT || mode == MODE_DRAG) xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT)
++            if (mode == MODE_RIGHT) xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT)
++        }
++    }
++
++    private fun cancelLongPress(view: View) {
++        longPressRunnable?.let { view.removeCallbacks(it) }
++        longPressRunnable = null
++    }
++
++    /** @return true 表示事件已被消费，不再交给上游触摸板逻辑 */
++    fun handle(event: MotionEvent, view: View, xServer: XServer): Boolean {
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN -> {
++                cancelLongPress(view)
++                moved = false
++                mode = MODE_LEFT
++                downX = event.x
++                downY = event.y
++                val (sx, sy) = toScreen(event, view, xServer)
++                runCatching {
++                    xServer.injectPointerMove(sx, sy)
++                    xServer.injectPointerButtonPress(Pointer.Button.BUTTON_LEFT)
++                }.onFailure { DealerDiag.warn("touch down inject failed", it) }
++
++                val runnable = Runnable {
++                    if (mode == MODE_LEFT && !moved) {
++                        runCatching {
++                            xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT)
++                            xServer.injectPointerButtonPress(Pointer.Button.BUTTON_RIGHT)
++                        }.onFailure { DealerDiag.warn("long press inject failed", it) }
++                        mode = MODE_RIGHT
++                        DealerDiag.kv("touch.longPress", "screen=($sx,$sy)")
++                    }
++                    longPressRunnable = null
++                }
++                longPressRunnable = runnable
++                view.postDelayed(runnable, DealerUi.LONG_PRESS_MS)
++                return true
++            }
++
++            MotionEvent.ACTION_POINTER_DOWN -> {
++                if (event.pointerCount >= 2) {
++                    cancelLongPress(view)
++                    // 双指接管后不再保留按键，避免"捏合时把左键一直按住"
++                    runCatching {
++                        if (mode == MODE_LEFT || mode == MODE_DRAG) xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT)
++                        if (mode == MODE_RIGHT) xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT)
++                    }
++                    mode = MODE_PINCH
++                    pinchPrevDist = twoFingerDistance(event)
++                    pinchAccum = 0f
++                    pinchWheelSteps = 0
++                }
++                return true
++            }
++
++            MotionEvent.ACTION_MOVE -> {
++                if (mode == MODE_PINCH || event.pointerCount >= 2) {
++                    if (event.pointerCount >= 2) {
++                        val dist = twoFingerDistance(event)
++                        val delta = dist - pinchPrevDist
++                        pinchPrevDist = dist
++                        pinchAccum += delta
++                        val step = stepPx(view)
++                        while (pinchAccum >= step) {
++                            wheel(xServer, up = true)
++                            pinchAccum -= step
++                            pinchWheelSteps++
++                        }
++                        while (pinchAccum <= -step) {
++                            wheel(xServer, up = false)
++                            pinchAccum += step
++                            pinchWheelSteps--
++                        }
++                    }
++                    return true
++                }
++
++                if (mode != MODE_LEFT && mode != MODE_DRAG && mode != MODE_RIGHT) return false
++
++                val travel = hypot(event.x - downX, event.y - downY)
++                if (!moved && travel > slopPx(view) && mode == MODE_LEFT) {
++                    moved = true
++                    cancelLongPress(view)
++                    mode = MODE_DRAG
++                    DealerDiag.kv("touch.drag", "start travel=${travel.toInt()}px")
++                }
++
++                val (sx, sy) = toScreen(event, view, xServer)
++                runCatching { xServer.injectPointerMove(sx, sy) }
++                    .onFailure { DealerDiag.warn("touch move inject failed", it) }
++                return true
++            }
++
++            MotionEvent.ACTION_POINTER_UP -> {
++                if (mode == MODE_PINCH) {
++                    // 还有手指留在屏幕上时先不恢复按键状态，等全部抬起
++                    if (event.pointerCount <= 2) {
++                        mode = MODE_IDLE
++                        DealerDiag.kv("touch.pinch", "wheelSteps=$pinchWheelSteps")
++                    }
++                }
++                return true
++            }
++
++            MotionEvent.ACTION_UP -> {
++                cancelLongPress(view)
++                runCatching {
++                    when (mode) {
++                        MODE_LEFT, MODE_DRAG -> xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT)
++                        MODE_RIGHT -> xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT)
++                    }
++                }.onFailure { DealerDiag.warn("touch up inject failed", it) }
++                if (mode == MODE_LEFT) DealerDiag.kv("touch.tap", "at=(${event.x.toInt()},${event.y.toInt()})")
++                mode = MODE_IDLE
++                return true
++            }
++
++            MotionEvent.ACTION_CANCEL -> {
++                cancelLongPress(view)
++                releaseAll(xServer)
++                mode = MODE_IDLE
++                return true
++            }
++        }
++        return false
++    }
++}
+diff --git a/app/src/main/java/app/gamenative/dealers/DealerUi.kt b/app/src/main/java/app/gamenative/dealers/DealerUi.kt
+new file mode 100644
+index 0000000..cdcd37a
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/DealerUi.kt
+@@ -0,0 +1,18 @@
++package app.gamenative.dealers
++
++/**
++ * 荷官骰子：全局交互策略。
++ *
++ * 只用触屏，不出现任何模拟器自带的虚拟手柄 / 输入法图标 / 浮层控件；
++ * 触摸由 [DealerTouch] 自己翻译成鼠标事件。
++ */
++object DealerUi {
++    /** 纯触屏模式：屏蔽虚拟手柄与模拟器自带的触摸板逻辑 */
++    const val TOUCH_ONLY = true
++
++    /** 长按判定（毫秒），超过且手指没明显移动即为长按 → 右键 */
++    const val LONG_PRESS_MS = 420L
++
++    /** 判定"还在同一个点"的像素容差（dp） */
++    const val TAP_SLOP_DP = 10f
 +}
 diff --git a/app/src/main/java/app/gamenative/dealers/LocalPayload.kt b/app/src/main/java/app/gamenative/dealers/LocalPayload.kt
 new file mode 100644
@@ -1186,19 +1438,118 @@ index 0000000..272a596
 +        }
 +    }
 +}
+diff --git a/app/src/main/java/app/gamenative/dealers/PlaqueDrawable.kt b/app/src/main/java/app/gamenative/dealers/PlaqueDrawable.kt
+new file mode 100644
+index 0000000..6d49a11
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/PlaqueDrawable.kt
+@@ -0,0 +1,82 @@
++package app.gamenative.dealers
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.ColorFilter
++import android.graphics.Paint
++import android.graphics.PixelFormat
++import android.graphics.Rect
++import android.graphics.drawable.Drawable
++
++/**
++ * 牌匾底图（assets/dealer/ui/plaque.png，透明底）的九宫格绘制，
++ * 用来当按钮背景：四角云纹不变形，中间随文字长度拉伸。
++ */
++class PlaqueDrawable(private val bitmap: Bitmap) : Drawable() {
++
++    private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
++
++    override fun draw(canvas: Canvas) {
++        val b = bounds
++        if (b.width() <= 0 || b.height() <= 0) return
++        val srcW = bitmap.width
++        val srcH = bitmap.height
++        val insetSrc = (srcH / 3).coerceAtMost(srcW / 3).coerceAtLeast(1)
++        val insetDst = (b.height() / 3).coerceAtLeast(1)
++
++        val srcL = 0
++        val srcR = srcW - insetSrc
++        val srcT = 0
++        val srcB = srcH - insetSrc
++        val dstL = b.left
++        val dstR = b.right - insetDst
++        val dstT = b.top
++        val dstB = b.bottom - insetDst
++
++        val srcRect = Rect()
++        val dstRect = Rect()
++
++        fun slice(sx: Int, sy: Int, sw: Int, sh: Int, dx: Int, dy: Int, dw: Int, dh: Int) {
++            if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return
++            srcRect.set(sx, sy, sx + sw, sy + sh)
++            dstRect.set(dx, dy, dx + dw, dy + dh)
++            canvas.drawBitmap(bitmap, srcRect, dstRect, paint)
++        }
++
++        // 四角
++        slice(0, 0, insetSrc, insetSrc, dstL, dstT, insetDst, insetDst)
++        slice(srcR, 0, insetSrc, insetSrc, dstR, dstT, b.right - dstR, insetDst)
++        slice(0, srcB, insetSrc, insetSrc, dstL, dstB, insetDst, b.bottom - dstB)
++        slice(srcR, srcB, insetSrc, insetSrc, dstR, dstB, b.right - dstR, b.bottom - dstB)
++
++        // 四边
++        slice(insetSrc, 0, srcR - insetSrc, insetSrc, dstL + insetDst, dstT, dstR - dstL - insetDst, insetDst)
++        slice(insetSrc, srcB, srcR - insetSrc, insetSrc, dstL + insetDst, dstB, dstR - dstL - insetDst, b.bottom - dstB)
++        slice(0, insetSrc, insetSrc, srcB - insetSrc, dstL, dstT + insetDst, insetDst, dstB - dstT - insetDst)
++        slice(srcR, insetSrc, insetSrc, srcB - insetSrc, dstR, dstT + insetDst, b.right - dstR, dstB - dstT - insetDst)
++
++        // 中心
++        slice(insetSrc, insetSrc, srcR - insetSrc, srcB - insetSrc, dstL + insetDst, dstT + insetDst, dstR - dstL - insetDst, dstB - dstT - insetDst)
++    }
++
++    override fun setAlpha(alpha: Int) {
++        paint.alpha = alpha
++    }
++
++    override fun setColorFilter(colorFilter: ColorFilter?) {
++        paint.colorFilter = colorFilter
++    }
++
++    @Deprecated("Deprecated in Java")
++    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
++
++    companion object {
++        /** 读内置底图；没有就返回 null，调用方回退到纯色胶囊 */
++        fun load(context: Context): PlaqueDrawable? = runCatching {
++            context.assets.open("dealer/ui/plaque.png").use { input ->
++                PlaqueDrawable(android.graphics.BitmapFactory.decodeStream(input))
++            }
++        }.getOrNull()
++    }
++}
 diff --git a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
-index 9328d7c..d649168 100644
+index 9328d7c..f5eb73e 100644
 --- a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
 +++ b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
-@@ -94,6 +94,7 @@ import androidx.lifecycle.LifecycleOwner
+@@ -94,6 +94,9 @@ import androidx.lifecycle.LifecycleOwner
  import androidx.lifecycle.compose.LocalLifecycleOwner
  import app.gamenative.PluviaApp
  import app.gamenative.PrefManager
 +import app.gamenative.dealers.DealerDiag
++import app.gamenative.dealers.DealerTouch
++import app.gamenative.dealers.DealerUi
  import app.gamenative.display.GamescopeInputSink
  import app.gamenative.display.GamescopePayload
  import app.gamenative.SteamBootstrap
-@@ -768,6 +769,23 @@ fun XServerScreen(
+@@ -702,6 +705,8 @@ fun XServerScreen(
+     var playingBlockedRemoteName by rememberSaveable { mutableStateOf<String?>(null) }
+     var steamHostFailure by remember { mutableStateOf<String?>(null) }
+     fun shouldShowMouseCursor(): Boolean {
++        // 荷官骰子：纯触屏，不画鼠标箭头
++        if (DealerUi.TOUCH_ONLY) return false
+         return !container.isDisableMouseInput &&
+             (!container.isTouchscreenMode || ui.currentGestureConfig.showCursorInTouchscreenMode)
+     }
+@@ -768,6 +773,23 @@ fun XServerScreen(
          }
      }
  
@@ -1222,7 +1573,7 @@ index 9328d7c..d649168 100644
      fun applyPerformanceHudConfig(config: PerformanceHudConfig) {
          ui.performanceHudConfig = config
          persistPerformanceHudConfig(config)
-@@ -944,11 +962,13 @@ fun XServerScreen(
+@@ -944,11 +966,13 @@ fun XServerScreen(
          val savedX = PrefManager.performanceHudXFraction
          val savedY = PrefManager.performanceHudYFraction
  
@@ -1238,6 +1589,67 @@ index 9328d7c..d649168 100644
      }
  
      fun movePerformanceHud(rawX: Float, rawY: Float, save: Boolean) {
+@@ -2141,7 +2165,17 @@ fun XServerScreen(
+                         false
+                     }
+                     if (!controlsHandled) {
+-                        PluviaApp.touchpadView?.onTouchEvent(event)
++                        if (DealerUi.TOUCH_ONLY) {
++                            val xs = runCatching { ui.xServerView?.getxServer() }.getOrNull()
++                            val v = ui.xServerView as? View
++                            if (xs != null && v != null) {
++                                DealerTouch.handle(event, v, xs)
++                            } else {
++                                PluviaApp.touchpadView?.onTouchEvent(event)
++                            }
++                        } else {
++                            PluviaApp.touchpadView?.onTouchEvent(event)
++                        }
+                     }
+                 }
+                 true
+@@ -2962,6 +2996,10 @@ fun XServerScreen(
+                 setShooterModeConfig(ui.currentShooterConfig)
+             }
+             PluviaApp.inputControlsView = icView
++            if (DealerUi.TOUCH_ONLY) {
++                icView.visibility = View.GONE
++                DealerDiag.kv("controls.hidden", "InputControlsView -> GONE")
++            }
+ 
+             // Wire SHOW_KEYBOARD binding callback for overlay control buttons
+             icView.setShowKeyboardCallback {
+@@ -3797,6 +3835,10 @@ private fun EditModeToolbar(
+ }
+ 
+ private fun showInputControls(profile: ControlsProfile, winHandler: WinHandler, container: Container) {
++    if (DealerUi.TOUCH_ONLY) {
++        DealerDiag.kv("controls.suppressed", "showInputControls(profile) skipped")
++        return
++    }
+     PluviaApp.radialMenuCoordinator?.setProfile(profile)
+ 
+     PluviaApp.inputControlsView?.let { icView ->
+@@ -3892,7 +3934,7 @@ private fun hideInputControls() {
+     PluviaApp.touchpadView?.isEnabled()?.let {
+         if (!it) {
+             PluviaApp.touchpadView?.setEnabled(true)
+-            PluviaApp.xServerView?.getRenderer()?.setCursorVisible(true)
++            PluviaApp.xServerView?.getRenderer()?.setCursorVisible(!DealerUi.TOUCH_ONLY)
+         }
+     }
+     PluviaApp.inputControlsView?.invalidate()
+@@ -4201,6 +4243,10 @@ private fun describeControllerSources(device: InputDevice): String {
+  * Shows or hides the onscreen controls
+  */
+ fun showInputControls(context: Context, show: Boolean) {
++    if (DealerUi.TOUCH_ONLY) {
++        PluviaApp.inputControlsView?.visibility = View.GONE
++        return
++    }
+     PluviaApp.inputControlsView?.let { icView ->
+         if (show) {
+             // Reload elements with current screen dimensions when showing controls
 diff --git a/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt b/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
 index d71e12b..8a7cee1 100644
 --- a/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
@@ -1295,6 +1707,50 @@ index 2f2848c..6cb9d76 100644
          try {
              SteamService.fetchFileWithFallback(
                  fileName = "container_files/${component.name}",
+diff --git a/app/src/main/java/com/winlator/inputcontrols/ControllerManager.java b/app/src/main/java/com/winlator/inputcontrols/ControllerManager.java
+index 5f3ee04..8897000 100644
+--- a/app/src/main/java/com/winlator/inputcontrols/ControllerManager.java
++++ b/app/src/main/java/com/winlator/inputcontrols/ControllerManager.java
+@@ -100,6 +100,15 @@ public class ControllerManager {
+      */
+     public void scanForDevices() {
+         detectedDevices.clear();
++        // 荷官骰子：部分机型（如 Android 17 的 OPPO）getSystemService("input") 会返回 null，
++        // 这里必须自己兜一次并且直接跳过扫描，否则一进 XServer 就 NPE 闪退。
++        if (inputManager == null && context != null) {
++            inputManager = (InputManager) context.getSystemService(Context.INPUT_SERVICE);
++        }
++        if (inputManager == null) {
++            Log.w(TAG, "InputManager unavailable; skipping controller scan");
++            return;
++        }
+         int[] deviceIds = inputManager.getInputDeviceIds();
+         Set<String> present = new HashSet<>();
+         for (int deviceId : deviceIds) {
+@@ -365,6 +374,7 @@ public class ControllerManager {
+     }
+ 
+     private String getDeviceIdentifierForDeviceId(int deviceId) {
++        if (inputManager == null) return null;
+         InputDevice device = inputManager.getInputDevice(deviceId);
+         String deviceIdentifier = getDeviceIdentifier(device);
+         if (deviceIdentifier != null) {
+@@ -412,6 +422,7 @@ public class ControllerManager {
+     }
+ 
+     public void onDeviceConnected(int deviceId) {
++        if (inputManager == null) return;
+         InputDevice device = inputManager.getInputDevice(deviceId);
+         if (device == null || !isGameController(device)) {
+             return;
+@@ -563,6 +574,7 @@ public class ControllerManager {
+     private void markActive(int deviceId) {
+         String identifier = getDeviceIdentifierForDeviceId(deviceId);
+         if (identifier == null || !sessionActiveIdentifiers.add(identifier)) return;
++        if (inputManager == null) return;
+         InputDevice device = inputManager.getInputDevice(deviceId);
+         if (device != null &&
+                 (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q || device.isExternal())) {
 diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
 index 0099a10..d8afbf7 100644
 --- a/app/src/main/res/values-zh-rCN/strings.xml

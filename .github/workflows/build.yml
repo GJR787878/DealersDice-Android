@@ -40,6 +40,8 @@ jobs:
           curl -fL --retry 3 -o app/src/main/assets/dealer/payload/proton-11.0-2-arm64ec.wcp "$base/proton-11.0-2-arm64ec.wcp"
           curl -fL --retry 3 -o app/src/main/assets/dealer/payload/FEXCore-2611-gn-7.wcp "$base/FEXCore-2611-gn-7.wcp"
           curl -fL --retry 3 -o app/src/main/assets/dealer/game.zip "https://github.com/GJR787878/DealersDice-Android/releases/download/payload-v1/game.zip"
+          mkdir -p app/src/main/assets/dealer/ui
+          curl -fL --retry 3 -o app/src/main/assets/dealer/ui/plaque.png "https://github.com/GJR787878/DealersDice-Android/releases/download/payload-v1/plaque.png"
           ls -la app/src/main/assets/dealer app/src/main/assets/dealer/payload
 
       - name: JDK 17
