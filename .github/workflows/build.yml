@@ -20,7 +20,7 @@ jobs:
         run: |
           git clone https://github.com/utkarshdalal/GameNative.git src
           cd src
-          if git cat-file -e ^{commit} 2>/dev/null; then git checkout ; else echo "pinned commit missing, staying on default branch"; fi
+          git checkout 458fe62169fabc3061d6ce513f5670d4ec337ef6
           git submodule update --init --recursive --depth 1
 
       - name: Apply patches
