@@ -1,0 +1,59 @@
+name: build-apk
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  BASE_COMMIT: 458fe62169fabc3061d6ce513f5670d4ec337ef6
+  GRADLE_OPTS: "-Xmx4g -Dorg.gradle.daemon=false"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream GameNative at pinned commit
+        run: |
+          git clone https://github.com/utkarshdalal/GameNative.git src
+          cd src
+          if git cat-file -e ^{commit} 2>/dev/null; then git checkout ; else echo "pinned commit missing, staying on default branch"; fi
+          git submodule update --init --recursive --depth 1
+
+      - name: Apply patches
+        run: |
+          cd src
+          shopt -s nullglob
+          for p in ../patches/*.patch; do echo "--- applying $p"; git apply -v "$p"; done
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+
+      - name: Build
+        run: |
+          cd src
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ./gradlew :app:assembleModernDebug -x lint --stacktrace
+
+      - name: Upload APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: |
+            src/app/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
