@@ -81,10 +81,10 @@ index 4926d11..8486234 100644
      // hardware. The settings switch requests the Bluetooth permissions before it can be turned on.
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerBoot.kt b/app/src/main/java/app/gamenative/dealers/DealerBoot.kt
 new file mode 100644
-index 0000000..13e98b4
+index 0000000..40880f4
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerBoot.kt
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,311 @@
 +package app.gamenative.dealers
 +
 +import android.content.Context
@@ -136,8 +136,15 @@ index 0000000..13e98b4
 +
 +    private const val PROGRESS_EXTRACT = 0.55f
 +
-+    /** 帧率档位（0 = 不限帧） */
-+    val FPS_CAPS = listOf(0, 30, 45, 60, 90, 120)
++    /**
++     * 精简的 Windows 组件开关：direct3d / vcrun / wmdecoder 全部关闭。
++     * 渲染走 Unity 原生 Vulkan，不需要 d3d 那一套；关掉也能避免首启从网上下组件。
++     */
++    const val MINIMAL_WINCOMPONENTS =
++        "direct3d=0,directsound=1,directinput8=0,directinput=0,directmusic=0,directshow=0,directplay=0,vcrun2010=0,wmdecoder=0,opengl=0"
++
++    /** 帧率档位（0 = 不限帧）：30 / 60 / 90 / 120 / 无限 */
++    val FPS_CAPS = listOf(0, 30, 60, 90, 120)
 +
 +    fun gameDir(context: Context): File =
 +        File(context.getExternalFilesDir(null), "custom_games/$FOLDER_NAME")
@@ -188,7 +195,11 @@ index 0000000..13e98b4
 +     * 把内置的游戏与兼容层落盘，并返回可启动的 appId。
 +     * 幂等：已初始化过的机器只做轻量校验。
 +     */
-+    suspend fun ensureReady(context: Context, onProgress: (Float, String) -> Unit): String {
++    suspend fun ensureReady(
++        context: Context,
++        resolution: String? = null,
++        onProgress: (Float, String) -> Unit,
++    ): String {
 +        onProgress(0f, "准备中")
 +        DealerDiag.stage("ensureReady.start", "ready=${isReady(context)}")
 +        val totalAt = System.currentTimeMillis()
@@ -240,7 +251,7 @@ index 0000000..13e98b4
 +            ?: FEX_ID
 +
 +        val container = ContainerUtils.getOrCreateContainer(context, appId)
-+        applyContainerConfig(context, container, wineVersion, fexVersion)
++        applyContainerConfig(context, container, wineVersion, fexVersion, resolution)
 +        DealerDiag.containerReport(context, appId)
 +
 +        markerFile(context).parentFile?.mkdirs()
@@ -335,6 +346,7 @@ index 0000000..13e98b4
 +        container: Container,
 +        wineVersion: String = "proton-11.0-2-arm64ec",
 +        fexVersion: String = FEX_ID,
++        resolution: String? = null,
 +    ) {
 +        val data = ContainerUtils.toContainerData(container)
 +
@@ -347,7 +359,7 @@ index 0000000..13e98b4
 +
 +        val ours = data.copy(
 +            name = GAME_LABEL,
-+            screenSize = PrefManager.dealerScreenSize ?: resolutionOptions(context).first(),
++            screenSize = resolution ?: PrefManager.dealerScreenSize ?: resolutionOptions(context).first(),
 +            envVars = envVars,
 +            execArgs = VULKAN_ARG,
 +            executablePath = EXE_NAME,
@@ -355,6 +367,9 @@ index 0000000..13e98b4
 +            fexcoreVersion = fexVersion,
 +            box64Version = "",
 +            dxwrapperConfig = "version=;vkd3dVersion=;framerate=0",
++            // 只留内核自带的 d3d；一开 direct3d 就会在首启去下载上百 MB 的组件，
++            // 表现为"黑屏卡住进不了游戏"
++            wincomponents = MINIMAL_WINCOMPONENTS,
 +            showFPS = true,
 +        )
 +        ContainerUtils.applyToContainer(context, container, ours)
@@ -383,7 +398,7 @@ index 0000000..13e98b4
 +}
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt b/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt
 new file mode 100644
-index 0000000..b818bd7
+index 0000000..cd46df9
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt
 @@ -0,0 +1,186 @@
@@ -469,7 +484,7 @@ index 0000000..b818bd7
 +        LaunchedEffect(picked) {
 +            val id = runCatching {
 +                withContext(Dispatchers.IO) {
-+                    DealerBoot.ensureReady(this@DealerBootActivity) { p, text ->
++                    DealerBoot.ensureReady(this@DealerBootActivity, resolution = picked) { p, text ->
 +                        progress = p
 +                        label = text
 +                    }
@@ -575,10 +590,10 @@ index 0000000..b818bd7
 +}
 diff --git a/app/src/main/java/app/gamenative/dealers/DealerDiag.kt b/app/src/main/java/app/gamenative/dealers/DealerDiag.kt
 new file mode 100644
-index 0000000..7bd7481
+index 0000000..9c7857a
 --- /dev/null
 +++ b/app/src/main/java/app/gamenative/dealers/DealerDiag.kt
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,407 @@
 +package app.gamenative.dealers
 +
 +import android.app.ActivityManager
@@ -724,6 +739,9 @@ index 0000000..7bd7481
 +                    "showFPS" to data.showFPS,
 +                    "cpuList" to data.cpuList,
 +                    "fpsLimiter" to "${PrefManager.dealerFpsCap}",
++                    "wincomponents" to data.wincomponents,
++                    "displayServer" to data.displayServer,
++                    "renderer" to data.renderer,
 +                ),
 +            )
 +        }.onFailure { warn("containerReport failed", it) }
@@ -1527,7 +1545,7 @@ index 0000000..6d49a11
 +    }
 +}
 diff --git a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
-index 9328d7c..f5eb73e 100644
+index 9328d7c..2d975da 100644
 --- a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
 +++ b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
 @@ -94,6 +94,9 @@ import androidx.lifecycle.LifecycleOwner
@@ -1579,9 +1597,9 @@ index 9328d7c..f5eb73e 100644
  
 -        hud.x = if (savedX in 0f..1f) maxX * savedX else margin.coerceAtMost(maxX)
 -        hud.y = if (savedY in 0f..1f) maxY * savedY else margin.coerceAtMost(maxY)
-+        // 荷官骰子：帧数固定显示在屏幕正中（不跟随拖动保存的位置）
++        // 荷官骰子：帧数固定显示在屏幕上边缘正中（水平居中，贴顶留一点边距）
 +        hud.x = maxX * 0.5f
-+        hud.y = maxY * 0.5f
++        hud.y = margin
  
          PrefManager.performanceHudXFraction = if (maxX > 0f) hud.x / maxX else 0f
          PrefManager.performanceHudYFraction = if (maxY > 0f) hud.y / maxY else 0f
