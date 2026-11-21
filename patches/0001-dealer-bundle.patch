@@ -1,0 +1,830 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 0f32602..e8307ca 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -41,6 +41,11 @@ android {
+     namespace = "app.gamenative"
+     compileSdk = 36
+ 
++    androidResources {
++        // 荷官骰子：内置兼容层与游戏压缩包不再二次压缩（打包更快，AssetManager 也能拿到长度）
++        noCompress += listOf("zip", "wcp", "tzst")
++    }
++
+     // https://developer.android.com/ndk/downloads
+     ndkVersion = "27.3.13750724"
+ 
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 2350a32..370d02a 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -185,6 +185,15 @@
+             android:exported="false"
+             android:theme="@style/Theme.Pluvia" />
+ 
++        <!-- 荷官骰子单入口：点开即进游戏 -->
++        <activity
++            android:name=".dealers.DealerBootActivity"
++            android:exported="true"
++            android:launchMode="singleTask"
++            android:screenOrientation="sensorLandscape"
++            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode"
++            android:theme="@style/Theme.Pluvia" />
++
+         <!-- Launcher icon aliases to allow switching app icon at runtime -->
+         <activity-alias
+             android:name=".MainActivityAliasDefault"
+@@ -192,7 +201,7 @@
+             android:exported="true"
+             android:icon="@mipmap/ic_launcher"
+             android:label="@string/app_name"
+-            android:targetActivity=".MainActivity">
++            android:targetActivity=".dealers.DealerBootActivity">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
+@@ -204,7 +213,7 @@
+             android:exported="true"
+             android:icon="@mipmap/ic_launcher_alt"
+             android:label="@string/app_name"
+-            android:targetActivity=".MainActivity">
++            android:targetActivity=".dealers.DealerBootActivity">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
+diff --git a/app/src/main/java/app/gamenative/PrefManager.kt b/app/src/main/java/app/gamenative/PrefManager.kt
+index 4926d11..8486234 100644
+--- a/app/src/main/java/app/gamenative/PrefManager.kt
++++ b/app/src/main/java/app/gamenative/PrefManager.kt
+@@ -1796,6 +1796,22 @@ object PrefManager {
+             setPref(CUSTOM_GAME_MANUAL_FOLDERS, Json.encodeToString(value))
+         }
+ 
++    /** 荷官骰子：会话分辨率（形如 "1920x1080"），空表示跟随设备原生 */
++    private val DEALER_SCREEN_SIZE = stringPreferencesKey("dealer_screen_size")
++    var dealerScreenSize: String?
++        get() = getPref(DEALER_SCREEN_SIZE, "").ifEmpty { null }
++        set(value) {
++            setPref(DEALER_SCREEN_SIZE, value ?: "")
++        }
++
++    /** 荷官骰子：帧率上限（0 = 不限） */
++    private val DEALER_FPS_CAP = intPreferencesKey("dealer_fps_cap")
++    var dealerFpsCap: Int
++        get() = getPref(DEALER_FPS_CAP, 0)
++        set(value) {
++            setPref(DEALER_FPS_CAP, value)
++        }
++
+     // Steam Controller (2026 "Triton") BLE support. OFF by default: enabling it makes every game launch connect to
+     // the controller over BLE, which is pure overhead (and a runtime BT-permission prompt) for anyone without the
+     // hardware. The settings switch requests the Bluetooth permissions before it can be turned on.
+diff --git a/app/src/main/java/app/gamenative/dealers/DealerBoot.kt b/app/src/main/java/app/gamenative/dealers/DealerBoot.kt
+new file mode 100644
+index 0000000..7c0f53f
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/DealerBoot.kt
+@@ -0,0 +1,284 @@
++package app.gamenative.dealers
++
++import android.content.Context
++import android.net.Uri
++import app.gamenative.PrefManager
++import app.gamenative.data.LibraryItem
++import app.gamenative.utils.ContainerUtils
++import app.gamenative.utils.CustomGameScanner
++import app.gamenative.utils.ManifestComponentHelper
++import app.gamenative.utils.ManifestEntry
++import app.gamenative.utils.ManifestInstaller
++import com.winlator.contents.ContentProfile
++import com.winlator.container.Container
++import timber.log.Timber
++import java.io.File
++import java.util.zip.ZipInputStream
++
++/**
++ * 荷官骰子 / Dealer's Dice —— 单入口引导逻辑。
++ *
++ * 目标：装机即玩。第一次启动把内置的游戏与兼容层落到应用私有目录，建好容器与快捷方式，
++ * 之后每次启动直接进游戏，不再经过任何商店/设置界面。
++ *
++ * 运行栈：Proton 11.0-2 ARM64EC (Wine) + FEXCore（x86-64 翻译），渲染走 Unity 原生 Vulkan
++ * （启动参数 -force-vulkan），不启用 DXVK/VKD3D，也不启用 Box64/WOWBox64。
++ */
++object DealerBoot {
++
++    /** 游戏目录名（自定义游戏标识） */
++    const val FOLDER_NAME = "DealersDice"
++
++    /** 展示名 */
++    const val GAME_LABEL = "荷官骰子"
++
++    /** 主程序 */
++    const val EXE_NAME = "Dealer's Dice.exe"
++
++    /** Unity 原生 Vulkan 渲染：跳过 D3D12 → Vulkan 的翻译层 */
++    const val VULKAN_ARG = "-force-vulkan"
++
++    /** 内置的 Proton 包（assets/dealer/proton-11.0-2-arm64ec.wcp） */
++    private const val PROTON_FILE = "proton-11.0-2-arm64ec.wcp"
++
++    /** 内置的 FEXCore 包（assets/dealer/FEXCore-2611-gn-7.wcp） */
++    private const val FEX_FILE = "FEXCore-2611-gn-7.wcp"
++
++    const val PROTON_ID = "proton-11.0-2-arm64ec-1"
++    const val FEX_ID = "2611-gn-7-0"
++
++    private const val PROGRESS_EXTRACT = 0.55f
++
++    /** 帧率档位（0 = 不限帧） */
++    val FPS_CAPS = listOf(0, 30, 45, 60, 90, 120)
++
++    fun gameDir(context: Context): File =
++        File(context.getExternalFilesDir(null), "custom_games/$FOLDER_NAME")
++
++    private fun markerFile(context: Context): File = File(context.filesDir, ".dealer_ready")
++
++    /**
++     * 按设备真实分辨率推导出的缩放分辨率候选。首位永远是设备原生尺寸。
++     * 竖屏数值统一成宽 > 高的横向尺寸，因为游戏是横屏。
++     */
++    fun resolutionOptions(context: Context): List<String> {
++        val dm = context.resources.displayMetrics
++        val longSide = maxOf(dm.widthPixels, dm.heightPixels)
++        val shortSide = minOf(dm.widthPixels, dm.heightPixels)
++
++        val out = LinkedHashSet<String>()
++        out.add("${longSide}x${shortSide}")
++
++        // 同宽高比的等比缩放档
++        for (scale in listOf(0.75f, 0.66f, 0.5f)) {
++            val w = even(longSide * scale)
++            val h = even(shortSide * scale)
++            if (w >= 1280) out.add("${w}x${h}")
++        }
++
++        // 常见 16:9 / 16:10 档位：只在不超过设备原生长边时提供
++        for ((w, h) in listOf(2560 to 1440, 1920 to 1080, 1600 to 900, 1280 to 720)) {
++            if (w <= longSide) out.add("${w}x${h}")
++        }
++        return out.toList()
++    }
++
++    private fun even(v: Float): Int {
++        val i = v.toInt()
++        return if (i % 2 == 0) i else i - 1
++    }
++
++    fun savedResolution(context: Context): String? = PrefManager.dealerScreenSize
++
++    fun saveResolution(context: Context, value: String) {
++        PrefManager.dealerScreenSize = value
++    }
++
++    /** 是否已经初始化过（游戏已解包、容器已建好） */
++    fun isReady(context: Context): Boolean = markerFile(context).isFile()
++
++    /**
++     * 把内置的游戏与兼容层落盘，并返回可启动的 appId。
++     * 幂等：已初始化过的机器只做轻量校验。
++     */
++    suspend fun ensureReady(context: Context, onProgress: (Float, String) -> Unit): String {
++        onProgress(0f, "准备中")
++
++        val dir = gameDir(context)
++        if (!isReady(context) || !dir.isDirectory) {
++            dir.mkdirs()
++            onProgress(0.02f, "解压游戏")
++            extractGame(context, dir) { p ->
++                onProgress(p * PROGRESS_EXTRACT, "解压游戏 ${(p * 100).toInt()}%")
++            }
++        }
++
++        onProgress(0.6f, "注册游戏")
++        val folders = PrefManager.customGameManualFolders.toMutableSet()
++        folders.add(dir.absolutePath)
++        PrefManager.customGameManualFolders = folders
++        CustomGameScanner.invalidateCache()
++
++        val item: LibraryItem? = CustomGameScanner.createLibraryItemFromFolder(dir.absolutePath)
++        val appId = item?.appId?.takeIf { it.isNotEmpty() }
++            ?: run {
++                // 扫描器没认出时退化为固定 id，仍能挂在自定义游戏容器上
++                "CUSTOM_GAME_1"
++            }
++        Timber.i("DealerBoot: appId=$appId dir=${dir.absolutePath}")
++
++        onProgress(0.65f, "安装兼容层")
++        installComponents(context) { p -> onProgress(0.65f + p * 0.3f, "安装兼容层 ${(p * 100).toInt()}%") }
++
++        onProgress(0.97f, "配置容器")
++        // 安装后按实际落盘的版本标识回填，避免写死字符串与镜像不一致
++        val installedNow = runCatching {
++            ManifestComponentHelper.loadInstalledContentLists(context)
++        }.getOrNull()
++        val wineVersion = installedNow?.installed?.proton
++            ?.firstOrNull { it.contains("11.0-2") }
++            ?: "proton-11.0-2-arm64ec"
++        val fexVersion = installedNow?.installed?.fexcore
++            ?.firstOrNull { it.contains("2611") }
++            ?: FEX_ID
++
++        val container = ContainerUtils.getOrCreateContainer(context, appId)
++        applyContainerConfig(context, container, wineVersion, fexVersion)
++
++        markerFile(context).parentFile?.mkdirs()
++        markerFile(context).writeText(appId)
++        onProgress(1f, "完成")
++        return appId
++    }
++
++    private fun extractGame(context: Context, dir: File, onProgress: (Float) -> Unit) {
++        val assetName = "dealer/game.zip"
++        val total = runCatching { context.assets.open(assetName).use { it.available() } }.getOrDefault(0)
++        var read = 0
++        var last = -1
++        ZipInputStream(context.assets.open(assetName).buffered()).use { zis ->
++            var entry = zis.nextEntry
++            while (entry != null) {
++                val out = File(dir, entry.name)
++                if (entry.isDirectory) {
++                    out.mkdirs()
++                } else {
++                    out.parentFile?.mkdirs()
++                    out.outputStream().use { os ->
++                        val buf = ByteArray(1 shl 16)
++                        while (true) {
++                            val n = zis.read(buf)
++                            if (n <= 0) break
++                            os.write(buf, 0, n)
++                            read += n
++                            if (total > 0) {
++                                val p = (read.toFloat() / total).coerceIn(0f, 1f)
++                                val bucket = (p * 100).toInt()
++                                if (bucket != last) {
++                                    last = bucket
++                                    onProgress(p)
++                                }
++                            }
++                        }
++                    }
++                }
++                zis.closeEntry()
++                entry = zis.nextEntry
++            }
++        }
++        onProgress(1f)
++    }
++
++    /** 安装 Proton + FEXCore：命中内置包时完全离线，不访问网络 */
++    private suspend fun installComponents(context: Context, onProgress: (Float) -> Unit) {
++        val installed = runCatching {
++            ManifestComponentHelper.loadInstalledContentLists(context)
++        }.getOrNull()
++
++        val protonMissing = installed?.installed?.proton?.none { it.contains("11.0-2") } ?: true
++        val fexMissing = installed?.installed?.fexcore?.none { it.contains("2611") } ?: true
++
++        if (protonMissing) {
++            onProgress(0.05f)
++            ManifestInstaller.installManifestEntry(
++                context = context,
++                entry = ManifestEntry(
++                    id = PROTON_ID,
++                    name = "Proton 11.0-2 ARM64ec",
++                    url = "https://downloads.gamenative.app/$PROTON_FILE",
++                ),
++                isDriver = false,
++                contentType = ContentProfile.ContentType.CONTENT_TYPE_PROTON,
++                onProgress = { p -> onProgress(0.05f + p * 0.65f) },
++            )
++        }
++
++        if (fexMissing) {
++            onProgress(0.75f)
++            ManifestInstaller.installManifestEntry(
++                context = context,
++                entry = ManifestEntry(
++                    id = FEX_ID,
++                    name = "FEX 2611-gn",
++                    url = "https://downloads.gamenative.app/$FEX_FILE",
++                ),
++                isDriver = false,
++                contentType = ContentProfile.ContentType.CONTENT_TYPE_FEXCORE,
++                onProgress = { p -> onProgress(0.75f + p * 0.2f) },
++            )
++        }
++        onProgress(1f)
++    }
++
++    /** 写死运行栈：原生 Vulkan、只留 FEX、容器内 vblank 关掉 */
++    fun applyContainerConfig(
++        context: Context,
++        container: Container,
++        wineVersion: String = "proton-11.0-2-arm64ec",
++        fexVersion: String = FEX_ID,
++    ) {
++        val data = ContainerUtils.toContainerData(container)
++
++        // 环境变量是空格分隔的 "K=V K=V"
++        val envVars = buildString {
++            append(data.envVars.ifEmpty { Container.DEFAULT_ENV_VARS })
++            if (!contains("PROTON_USE_WINED3D")) append(" PROTON_USE_WINED3D=0")
++            if (!contains("vblank_mode")) append(" vblank_mode=0")
++        }
++
++        val ours = data.copy(
++            name = GAME_LABEL,
++            screenSize = PrefManager.dealerScreenSize ?: resolutionOptions(context).first(),
++            envVars = envVars,
++            execArgs = VULKAN_ARG,
++            executablePath = EXE_NAME,
++            wineVersion = wineVersion,
++            fexcoreVersion = fexVersion,
++            box64Version = "",
++            dxwrapperConfig = "version=;vkd3dVersion=;framerate=0",
++            showFPS = true,
++        )
++        ContainerUtils.applyToContainer(context, container, ours)
++
++        container.putExtra("fpsLimiterEnabled", PrefManager.dealerFpsCap > 0)
++        container.putExtra("fpsLimiterTarget", PrefManager.dealerFpsCap)
++    }
++
++    /** 首次进入时把 HUD 设成"只显示帧率、居中、小号" */
++    fun applyHudPrefs() {
++        PrefManager.showFps = true
++        PrefManager.performanceHudShowFrameRate = true
++        PrefManager.performanceHudShowCpuUsage = false
++        PrefManager.performanceHudShowGpuUsage = false
++        PrefManager.performanceHudShowRamUsage = false
++        PrefManager.performanceHudShowBatteryLevel = false
++        PrefManager.performanceHudShowPowerDraw = false
++        PrefManager.performanceHudShowBatteryTemperature = false
++        PrefManager.performanceHudShowCpuTemperature = false
++        PrefManager.performanceHudShowGpuTemperature = false
++        PrefManager.performanceHudShowBottleneck = false
++        PrefManager.performanceHudShowFrameRateGraph = false
++    }
++
++    fun uriOf(file: File): Uri = Uri.fromFile(file)
++}
+diff --git a/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt b/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt
+new file mode 100644
+index 0000000..1fce3b7
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/DealerBootActivity.kt
+@@ -0,0 +1,173 @@
++package app.gamenative.dealers
++
++import android.os.Bundle
++import androidx.activity.ComponentActivity
++import androidx.activity.compose.setContent
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import app.gamenative.ui.screen.xserver.XServerScreen
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import timber.log.Timber
++
++/**
++ * 唯一入口：点开就是游戏。
++ *
++ * 首启把内置游戏与兼容层落盘并建容器（带进度），之后直接进 XServer 会话。
++ * 没有商店、没有登录、没有容器设置界面。
++ */
++class DealerBootActivity : ComponentActivity() {
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        DealerBoot.applyHudPrefs()
++        setContent { DealerRoot() }
++        // 覆盖层要压在 Compose 内容之上，等 decor 有子 View 后再挂
++        window.decorView.post { attachDealerOverlay(this) }
++    }
++
++    override fun onResume() {
++        super.onResume()
++        window.decorView.post { attachDealerOverlay(this) }
++    }
++
++    @Composable
++    private fun DealerRoot() {
++        var appId by remember { mutableStateOf<String?>(null) }
++        var progress by remember { mutableStateOf(0f) }
++        var label by remember { mutableStateOf("准备中") }
++        var screen by remember { mutableStateOf(DealerBoot.savedResolution(this@DealerBootActivity)) }
++
++        // 第一次启动时先选一档分辨率；之后记住选择，不再打扰
++        val picked = screen
++        if (picked == null) {
++            val options = remember { DealerBoot.resolutionOptions(this@DealerBootActivity) }
++            ResolutionPicker(options) { v ->
++                DealerBoot.saveResolution(this@DealerBootActivity, v)
++                screen = v
++            }
++            return
++        }
++
++        LaunchedEffect(picked) {
++            val id = runCatching {
++                withContext(Dispatchers.IO) {
++                    DealerBoot.ensureReady(this@DealerBootActivity) { p, text ->
++                        progress = p
++                        label = text
++                    }
++                }
++            }.onFailure { Timber.e(it, "DealerBoot.ensureReady failed") }.getOrNull()
++            appId = id
++        }
++
++        val id = appId
++        if (id == null) {
++            Box(
++                modifier = Modifier.fillMaxSize().background(Color.Black),
++                contentAlignment = Alignment.Center,
++            ) {
++                Column(
++                    horizontalAlignment = Alignment.CenterHorizontally,
++                    verticalArrangement = Arrangement.Center,
++                    modifier = Modifier.padding(32.dp),
++                ) {
++                    Text(
++                        text = DealerBoot.GAME_LABEL,
++                        color = Color.White,
++                        fontSize = 26.sp,
++                        fontWeight = FontWeight.Bold,
++                    )
++                    Spacer(Modifier.height(18.dp))
++                    Text(text = label, color = Color(0xFFCCCCCC), fontSize = 14.sp)
++                    Spacer(Modifier.height(10.dp))
++                    Text(
++                        text = "${(progress * 100).toInt()}%",
++                        color = Color(0xFF0A84FF),
++                        fontSize = 14.sp,
++                    )
++                }
++            }
++        } else {
++            XServerScreen(
++                appId = id,
++                execArgs = null,
++                bootToContainer = false,
++                registerBackAction = { _ -> },
++                navigateBack = { finish() },
++                onExit = { _ -> finish() },
++            )
++        }
++    }
++
++    @Composable
++    private fun ResolutionPicker(options: List<String>, onPick: (String) -> Unit) {
++        Box(
++            modifier = Modifier.fillMaxSize().background(Color.Black),
++            contentAlignment = Alignment.Center,
++        ) {
++            Column(
++                horizontalAlignment = Alignment.CenterHorizontally,
++                modifier = Modifier.padding(28.dp).fillMaxWidth(),
++            ) {
++                Text(
++                    text = DealerBoot.GAME_LABEL,
++                    color = Color.White,
++                    fontSize = 24.sp,
++                    fontWeight = FontWeight.Bold,
++                )
++                Spacer(Modifier.height(8.dp))
++                Text(
++                    text = "选择一档画面分辨率（点一下即开始，以后不用再选）",
++                    color = Color(0xFFAAAAAA),
++                    fontSize = 13.sp,
++                    textAlign = TextAlign.Center,
++                )
++                Spacer(Modifier.height(22.dp))
++                options.forEachIndexed { index, value ->
++                    val native = index == 0
++                    Box(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(vertical = 6.dp)
++                            .background(Color(0xFF1C1C1E), androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
++                            .clickable { onPick(value) }
++                            .padding(horizontal = 18.dp, vertical = 14.dp),
++                    ) {
++                        Column {
++                            Text(
++                                text = if (native) "设备原生（最清晰）" else "缩放",
++                                color = Color.White,
++                                fontSize = 15.sp,
++                            )
++                            Spacer(Modifier.height(2.dp))
++                            Text(text = value, color = Color(0xFF0A84FF), fontSize = 12.sp)
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt b/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt
+new file mode 100644
+index 0000000..2e33f30
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/DealerOverlayView.kt
+@@ -0,0 +1,123 @@
++package app.gamenative.dealers
++
++import android.content.Context
++import android.graphics.Color
++import android.graphics.drawable.GradientDrawable
++import android.os.SystemClock
++import android.util.TypedValue
++import android.view.Gravity
++import android.view.View
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.TextView
++import app.gamenative.PluviaApp
++import app.gamenative.PrefManager
++import com.winlator.xenvironment.components.XServerComponent
++import com.winlator.xserver.XKeycode
++
++/**
++ * 游戏画面之上的极简覆盖层：
++ *  - 左上角「菜单」= 发送 ESC 想游戏
++ *  - 左上角「帧率」= 循环切档（不限 / 30 / 45 / 60 / 90 / 120）
++ * 帧数显示用容器自带的性能 HUD（已固定在屏幕中间，只显示帧率）。
++ */
++class DealerOverlayView(context: Context) : LinearLayout(context) {
++
++    private val menuButton: TextView = capsule(context, "菜单")
++    private val fpsButton: TextView = capsule(context, "帧率")
++    private var lastPress = 0L
++
++    init {
++        orientation = HORIZONTAL
++        gravity = Gravity.TOP or Gravity.START
++        isClickable = false
++        val pad = dp(context, 8)
++        setPadding(pad, pad, pad, pad)
++
++        addView(menuButton, rowParams())
++        addView(fpsButton, rowParams())
++        refreshFpsLabel()
++
++        menuButton.setOnClickListener { sendEscape() }
++        fpsButton.setOnClickListener { cycleFrameCap() }
++    }
++
++    fun attachTo(host: FrameLayout) {
++        val lp = FrameLayout.LayoutParams(
++            FrameLayout.LayoutParams.WRAP_CONTENT,
++            FrameLayout.LayoutParams.WRAP_CONTENT,
++        ).apply {
++            gravity = Gravity.TOP or Gravity.START
++            leftMargin = dp(context, 6)
++            topMargin = dp(context, 6)
++        }
++        host.addView(this, lp)
++        bringToFront()
++    }
++
++    private fun sendEscape() {
++        val now = SystemClock.uptimeMillis()
++        if (now - lastPress < 250) return
++        lastPress = now
++        val xServer = PluviaApp.xEnvironment
++            ?.getComponent(XServerComponent::class.java)
++            ?.xServer
++            ?: return
++        runCatching {
++            xServer.injectKeyPress(XKeycode.KEY_ESC)
++            postDelayed({ runCatching { xServer.injectKeyRelease(XKeycode.KEY_ESC) } }, 80)
++        }
++    }
++
++    private fun cycleFrameCap() {
++        val current = PrefManager.dealerFpsCap
++        val idx = DealerBoot.FPS_CAPS.indexOf(current).let { if (it < 0) 0 else it }
++        val next = DealerBoot.FPS_CAPS[(idx + 1) % DealerBoot.FPS_CAPS.size]
++        PrefManager.dealerFpsCap = next
++        PluviaApp.xServerView?.setFrameRateLimit(next)
++        refreshFpsLabel()
++    }
++
++    private fun refreshFpsLabel() {
++        val cap = PrefManager.dealerFpsCap
++        fpsButton.text = if (cap == 0) "帧率 不限" else "帧率 $cap"
++    }
++
++    private fun rowParams(): LayoutParams = LayoutParams(
++        LayoutParams.WRAP_CONTENT,
++        LayoutParams.WRAP_CONTENT,
++    ).apply { rightMargin = dp(context, 8) }
++
++    private companion object {
++        fun dp(context: Context, value: Int): Int = TypedValue.applyDimension(
++            TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), context.resources.displayMetrics,
++        ).toInt()
++
++        fun capsule(context: Context, label: String): TextView = TextView(context).apply {
++            text = label
++            setTextColor(Color.WHITE)
++            textSize = 13f
++            gravity = Gravity.CENTER
++            val padH = dp(context, 14)
++            val padV = dp(context, 6)
++            setPadding(padH, padV, padH, padV)
++            background = GradientDrawable().apply {
++                cornerRadius = dp(context, 22).toFloat()
++                setColor(0xCC1C1C1E.toInt())
++                setStroke(dp(context, 1), 0x66FFFFFF)
++            }
++            isClickable = true
++            isFocusable = true
++            alpha = 0.92f
++        }
++    }
++}
++
++/** 把覆盖层挂到 Activity 最上层（在 Compose 内容之上） */
++fun attachDealerOverlay(activity: android.app.Activity) {
++    val decor = activity.window?.decorView as? FrameLayout ?: return
++    if (decor.findViewWithTag<View>("dealer_overlay") != null) return
++    val overlay = DealerOverlayView(activity)
++    overlay.tag = "dealer_overlay"
++    overlay.attachTo(decor)
++}
+diff --git a/app/src/main/java/app/gamenative/dealers/LocalPayload.kt b/app/src/main/java/app/gamenative/dealers/LocalPayload.kt
+new file mode 100644
+index 0000000..272a596
+--- /dev/null
++++ b/app/src/main/java/app/gamenative/dealers/LocalPayload.kt
+@@ -0,0 +1,61 @@
++package app.gamenative.dealers
++
++import android.content.Context
++import timber.log.Timber
++import java.io.File
++
++/**
++ * 内置 payload：把兼容层与容器模板随包发出去，首次启动直接落盘，
++ * 不依赖 downloads.gamenative.app 的可用性。
++ *
++ * 目录：assets/dealer/payload/<原文件名>
++ */
++object LocalPayload {
++
++    private const val DIR = "dealer/payload"
++
++    fun has(context: Context, fileName: String): Boolean = runCatching {
++        context.assets.open("$DIR/$fileName").close()
++        true
++    }.getOrDefault(false)
++
++    /** 命中内置 payload 时拷贝到 dest 并返回 true；否则返回 false 交由上层走网络 */
++    fun copyFromAssets(
++        context: Context,
++        fileName: String,
++        dest: File,
++        onProgress: (Float) -> Unit = {},
++    ): Boolean {
++        if (fileName.isEmpty() || !has(context, fileName)) return false
++        return try {
++            dest.parentFile?.mkdirs()
++            val tmp = File(dest.absolutePath + ".part")
++            context.assets.open("$DIR/$fileName").use { input ->
++                tmp.outputStream().use { out ->
++                    val buf = ByteArray(1 shl 16)
++                    var total = 0L
++                    while (true) {
++                        val n = input.read(buf)
++                        if (n <= 0) break
++                        out.write(buf, 0, n)
++                        total += n
++                        onProgress(((total % 8_000_000L) / 8_000_000f).coerceIn(0f, 1f))
++                    }
++                }
++            }
++            if (tmp.length() <= 0L) {
++                tmp.delete()
++                false
++            } else {
++                if (dest.exists()) dest.delete()
++                tmp.renameTo(dest)
++                onProgress(1f)
++                Timber.i("LocalPayload: $fileName 来自内置 assets")
++                true
++            }
++        } catch (e: Exception) {
++            Timber.w(e, "LocalPayload: 读取内置 $fileName 失败")
++            false
++        }
++    }
++}
+diff --git a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
+index 9328d7c..7d5b8c5 100644
+--- a/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
++++ b/app/src/main/java/app/gamenative/ui/screen/xserver/XServerScreen.kt
+@@ -944,8 +944,9 @@ fun XServerScreen(
+         val savedX = PrefManager.performanceHudXFraction
+         val savedY = PrefManager.performanceHudYFraction
+ 
+-        hud.x = if (savedX in 0f..1f) maxX * savedX else margin.coerceAtMost(maxX)
+-        hud.y = if (savedY in 0f..1f) maxY * savedY else margin.coerceAtMost(maxY)
++        // 荷官骰子：帧数固定显示在屏幕正中（不跟随拖动保存的位置）
++        hud.x = maxX * 0.5f
++        hud.y = maxY * 0.5f
+ 
+         PrefManager.performanceHudXFraction = if (maxX > 0f) hud.x / maxX else 0f
+         PrefManager.performanceHudYFraction = if (maxY > 0f) hud.y / maxY else 0f
+diff --git a/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt b/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
+index d71e12b..8a7cee1 100644
+--- a/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
++++ b/app/src/main/java/app/gamenative/utils/ManifestInstaller.kt
+@@ -28,7 +28,16 @@ object ManifestInstaller {
+         var destFile: File? = null
+         try {
+             destFile = File(context.cacheDir, entry.url.substringAfterLast("/"))
+-            SteamService.fetchFile(entry.url, destFile, onProgress)
++            // 内置 payload 优先：命中就不走网络（荷官骰子离线装机）
++            if (!app.gamenative.dealers.LocalPayload.copyFromAssets(
++                    context,
++                    entry.url.substringAfterLast("/"),
++                    destFile,
++                    onProgress,
++                )
++            ) {
++                SteamService.fetchFile(entry.url, destFile, onProgress)
++            }
+             val uri = Uri.fromFile(destFile)
+             val name = AdrenotoolsManager(context).installDriver(uri)
+             if (name.isEmpty()) {
+@@ -124,7 +133,16 @@ object ManifestInstaller {
+         var destFile: File? = null
+         try {
+             destFile = File(context.cacheDir, entry.url.substringAfterLast("/"))
+-            SteamService.fetchFile(entry.url, destFile, onProgress)
++            // 内置 payload 优先：命中就不走网络（荷官骰子离线装机）
++            if (!app.gamenative.dealers.LocalPayload.copyFromAssets(
++                    context,
++                    entry.url.substringAfterLast("/"),
++                    destFile,
++                    onProgress,
++                )
++            ) {
++                SteamService.fetchFile(entry.url, destFile, onProgress)
++            }
+             val uri = Uri.fromFile(destFile)
+             val mgr = ContentsManager(context)
+ 
+diff --git a/app/src/main/java/app/gamenative/utils/downloader/ContainerFilesDownloader.kt b/app/src/main/java/app/gamenative/utils/downloader/ContainerFilesDownloader.kt
+index 2f2848c..6cb9d76 100644
+--- a/app/src/main/java/app/gamenative/utils/downloader/ContainerFilesDownloader.kt
++++ b/app/src/main/java/app/gamenative/utils/downloader/ContainerFilesDownloader.kt
+@@ -95,6 +95,12 @@ object ContainerFilesDownloader {
+ 
+         cacheDir.mkdirs()
+ 
++        // 内置 payload 优先（荷官骰子把容器模板与 extras 随包发出）
++        if (app.gamenative.dealers.LocalPayload.copyFromAssets(context, component.name, destFile, onProgress)) {
++            Timber.i("Container file $componentId 使用内置 payload")
++            return@withContext destFile
++        }
++
+         try {
+             SteamService.fetchFileWithFallback(
+                 fileName = "container_files/${component.name}",
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f75aaac..0f97937 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1,5 +1,5 @@
+ <resources>
+-    <string name="app_name">GameNative</string>
++    <string name="app_name">荷官骰子</string>
+     <string name="login_user">User Login</string>
+     <string name="login_2fa">Two Factor</string>
+     <string name="home">Home</string>

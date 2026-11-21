@@ -29,6 +29,19 @@ jobs:
           shopt -s nullglob
           for p in ../patches/*.patch; do echo "--- applying $p"; git apply -v "$p"; done
 
+      - name: Fetch bundled payload (game + compat layers)
+        run: |
+          cd src
+          mkdir -p app/src/main/assets/dealer/payload
+          base=https://downloads.gamenative.app
+          curl -fL --retry 3 -o app/src/main/assets/dealer/payload/extras.tzst "$base/container_files/extras.tzst"
+          curl -fL --retry 3 -o app/src/main/assets/dealer/payload/container_pattern_common_20260821.tzst "$base/container_files/container_pattern_common_20260821.tzst"
+          curl -fL --retry 3 -o app/src/main/assets/dealer/payload/container_pattern_gamenative.tzst "$base/container_files/container_pattern_gamenative.tzst"
+          curl -fL --retry 3 -o app/src/main/assets/dealer/payload/proton-11.0-2-arm64ec.wcp "$base/proton-11.0-2-arm64ec.wcp"
+          curl -fL --retry 3 -o app/src/main/assets/dealer/payload/FEXCore-2611-gn-7.wcp "$base/FEXCore-2611-gn-7.wcp"
+          curl -fL --retry 3 -o app/src/main/assets/dealer/game.zip "https://github.com/GJR787878/DealersDice-Android/releases/download/payload-v1/game.zip"
+          ls -la app/src/main/assets/dealer app/src/main/assets/dealer/payload
+
       - name: JDK 17
         uses: actions/setup-java@v4
         with:
